@@ -15,7 +15,7 @@ HEADERS = {
 }
 ​
 SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/tennis"
-ESPN_TOURNAMENT_URL = "https://www.espn.com/tennis/scoreboard/tournament/_/eventId/{event_id}/competitionType/{competition_type}"
+ESPN_HOST = "www.espn.com"
 LEAGUES = ["atp", "wta"]
 ​
 STATUS_ES = {
@@ -32,7 +32,8 @@ STATUS_ES = {
 MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 ​
 ​
@@ -52,6 +53,10 @@ def slugify(text):
     text = (text or "torneo").lower()
     text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
     return text or "torneo"
+​
+​
+def tournament_url(event_id, competition_type):
+    return "https://" + ESPN_HOST + f"/tennis/scoreboard/tournament/_/eventId/{event_id}/competitionType/{competition_type}"
 ​
 ​
 def get_json(url, timeout=20):
@@ -75,7 +80,7 @@ def channels_for(tournament, league):
     if league == "atp":
         links.append({"name": "Tennis TV ATP", "url": "https://www.tennistv.com/"})
     if league == "wta":
-        links.append({"name": "WTA Dónde ver", "url": "https://www.wtatennis.com/where-to-watch-tennis"})
+        links.append({"name": "WTA Donde ver", "url": "https://www.wtatennis.com/where-to-watch-tennis"})
     links.append({"name": "Tennis Channel", "url": "https://www.tennischannel.com/"})
     return links
 ​
@@ -89,7 +94,6 @@ def strip_tags(html):
 ​
 ​
 def parse_date_range(text):
-    # Examples: "July 26 - August 2, 2026" or "July 18 - 25, 2026"
     m = re.search(r"([A-Za-z]+)\s+(\d{1,2})(?:,\s*(\d{4}))?\s*-\s*(?:([A-Za-z]+)\s+)?(\d{1,2}),\s*(\d{4})", text or "")
     if not m:
         return None
@@ -98,18 +102,16 @@ def parse_date_range(text):
     mon2 = MONTHS.get((m2 or m1).lower())
     if not mon1 or not mon2:
         return None
-    year1 = int(y1 or y2)
-    year2 = int(y2)
     try:
-        start = date(year1, mon1, int(d1))
-        end = date(year2, mon2, int(d2))
+        start = date(int(y1 or y2), mon1, int(d1))
+        end = date(int(y2), mon2, int(d2))
         return start, end
     except Exception:
         return None
 ​
 ​
 def tournament_page_info(event_id, competition_type, league):
-    url = ESPN_TOURNAMENT_URL.format(event_id=event_id, competition_type=competition_type)
+    url = tournament_url(event_id, competition_type)
     info = {"url": url, "dateRangeText": "", "startDate": None, "endDate": None, "location": "", "competition": ""}
     try:
         lines = strip_tags(get_text(url))
@@ -170,9 +172,11 @@ def normalize_match_event(ev, league, tournament_fallback=None):
     competitors = comp.get("competitors") or []
     if len(competitors) < 2:
         return None
+​
     stype = comp.get("status", {}).get("type", {})
     status = stype.get("name") or ev.get("status", {}).get("type", {}).get("name") or "STATUS_SCHEDULED"
     status_text = STATUS_ES.get(status, stype.get("description") or stype.get("shortDetail") or "Programado")
+​
     players = []
     for c in competitors[:2]:
         name = athlete_name(c)
@@ -185,6 +189,7 @@ def normalize_match_event(ev, league, tournament_fallback=None):
             "score": player_score(c),
             "winner": bool(c.get("winner")),
         })
+​
     tournament = tournament_fallback or ev.get("season", {}).get("displayName") or ev.get("group", {}).get("name") or ("ATP" if league == "atp" else "WTA")
     venue = comp.get("venue") or {}
     notes = comp.get("notes") or []
@@ -193,12 +198,23 @@ def normalize_match_event(ev, league, tournament_fallback=None):
         round_name = notes[0].get("headline") or notes[0].get("type") or ""
     if not round_name:
         round_name = stype.get("shortDetail") or ev.get("shortName") or "Ronda por confirmar"
+​
     return {
-        "eventId": str(ev.get("id") or ""), "league": league, "tournamentId": slugify(tournament), "tournament": tournament,
-        "round": round_name, "court": venue.get("fullName") or venue.get("shortName") or "Cancha por confirmar",
-        "status": status, "statusText": status_text, "startTime": ev.get("date") or comp.get("date"), "players": players,
+        "eventId": str(ev.get("id") or ""),
+        "league": league,
+        "tournamentId": slugify(tournament),
+        "tournament": tournament,
+        "round": round_name,
+        "court": venue.get("fullName") or venue.get("shortName") or "Cancha por confirmar",
+        "status": status,
+        "statusText": status_text,
+        "startTime": ev.get("date") or comp.get("date"),
+        "players": players,
         "winnerName": next((p["name"] for p in players if p.get("winner")), None),
-        "channels": channels_for(tournament, league), "stats": {}, "source": "ESPN", "lastUpdated": now_iso(),
+        "channels": channels_for(tournament, league),
+        "stats": {},
+        "source": "ESPN",
+        "lastUpdated": now_iso(),
     }
 ​
 ​
@@ -211,19 +227,35 @@ def tournament_summary_event(ev, league, date_str):
     if info.get("pageTitle") and len(info["pageTitle"]) > len(tournament):
         tournament = info["pageTitle"]
     stype = comp.get("status", {}).get("type", {}) or {}
+    active = is_active_range(info, date_str)
     return {
-        "eventId": event_id, "league": league, "tournamentId": slugify(tournament), "tournament": tournament,
-        "round": info.get("competition") or "Campeonato", "court": info.get("location") or "Sede por confirmar",
-        "status": stype.get("name") or "STATUS_SCHEDULED", "statusText": "Vigente" if is_active_range(info, date_str) else "No vigente",
-        "startTime": ev.get("date") or comp.get("date"), "players": [], "winnerName": None,
-        "channels": channels_for(tournament, league), "stats": {}, "source": "ESPN", "lastUpdated": now_iso(),
-        "isTournamentOnly": True, "espnTournamentUrl": info.get("url"), "dateRangeText": info.get("dateRangeText"),
-        "location": info.get("location"), "competition": info.get("competition"), "isActiveTournament": is_active_range(info, date_str),
+        "eventId": event_id,
+        "league": league,
+        "tournamentId": slugify(tournament),
+        "tournament": tournament,
+        "round": info.get("competition") or "Campeonato",
+        "court": info.get("location") or "Sede por confirmar",
+        "status": stype.get("name") or "STATUS_SCHEDULED",
+        "statusText": "Vigente" if active else "No vigente",
+        "startTime": ev.get("date") or comp.get("date"),
+        "players": [],
+        "winnerName": None,
+        "channels": channels_for(tournament, league),
+        "stats": {},
+        "source": "ESPN",
+        "lastUpdated": now_iso(),
+        "isTournamentOnly": True,
+        "espnTournamentUrl": info.get("url"),
+        "dateRangeText": info.get("dateRangeText"),
+        "location": info.get("location"),
+        "competition": info.get("competition"),
+        "isActiveTournament": active,
     }
 ​
 ​
 def fetch_scoreboard(league, date_str):
-    return get_json(f"{SITE_BASE}/{league}/scoreboard?dates={yyyymmdd(date_str)}&limit=500")
+    url = f"{SITE_BASE}/{league}/scoreboard?dates={yyyymmdd(date_str)}&limit=500"
+    return get_json(url)
 ​
 ​
 def load_matches(date_str):
@@ -248,7 +280,12 @@ def load_matches(date_str):
 ​
 @app.route("/")
 def index():
-    return "Tenis Live Pro API - ESPN"
+    return "Tenis Live Pro API - ESPN v1.0 FINAL3"
+​
+​
+@app.route("/api/version")
+def version():
+    return jsonify({"app": "Tenis Live Pro", "version": "1.0 FINAL3", "source": "ESPN", "fix": "clean_file_no_hidden_chars"})
 ​
 ​
 @app.route("/api/fixture")
