@@ -5,6 +5,8 @@ from html import unescape
 import os
 import re
 import requests
+from urllib.parse import quote_plus
+from xml.etree import ElementTree
 
 app = Flask(__name__)
 CORS(app)
@@ -454,6 +456,77 @@ def tournament_detail(league, event_id):
     detail = parse_tournament_page(url, event_id, league, request.args.get("name") or "Torneo")
     return jsonify({"eventId": event_id, "league": league, "updated": now_iso(), "detail": detail})
 
+def search_text(value):
+    value = re.sub(r"<[^>]+>", " ", value or "")
+    return re.sub(r"\s+", " ", unescape(value)).strip()
+
+
+def web_search(query, limit=5):
+    url = f"https://www.bing.com/search?format=rss&setlang=es&q={quote_plus(query)}"
+    response = requests.get(url, headers=HEADERS_JSON, timeout=15)
+    response.raise_for_status()
+
+    root = ElementTree.fromstring(response.content)
+    results = []
+    seen = set()
+
+    for item in root.findall(".//item"):
+        title = search_text(item.findtext("title"))
+        link = (item.findtext("link") or "").strip()
+        description = search_text(item.findtext("description"))
+
+        if not title or not link or link in seen:
+            continue
+
+        seen.add(link)
+        results.append({
+            "title": title,
+            "url": link,
+            "description": description
+        })
+
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+@app.route("/api/consulta", methods=["POST"])
+def consulta():
+    body = request.get_json(silent=True) or {}
+    question = re.sub(r"\s+", " ", str(body.get("question") or "")).strip()
+    subject = re.sub(r"\s+", " ", str(body.get("subject") or "")).strip()[:80]
+
+    if len(question) < 3 or len(question) > 300:
+        return jsonify({"error": "Escribe una pregunta válida."}), 400
+
+    search_query = f'tenis "{subject}" {question}' if subject else f"tenis {question}"
+
+    try:
+        results = web_search(search_query, 5)
+    except Exception:
+        return jsonify({
+            "error": "La búsqueda en Internet no está disponible en este momento."
+        }), 503
+
+    if not results:
+        return jsonify({
+            "answer": "No encontré información reciente para esa pregunta.",
+            "sources": [],
+            "updated": now_iso()
+        })
+
+    answer = " ".join(
+        result["description"] or result["title"]
+        for result in results[:3]
+    )
+
+    return jsonify({
+        "answer": answer or "Encontré fuentes relacionadas con tu pregunta.",
+        "sources": results,
+        "updated": now_iso(),
+        "query": question
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
