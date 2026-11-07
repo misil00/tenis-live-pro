@@ -472,11 +472,11 @@ def player():
 def gemini_answer(question):
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return None, "La consulta inteligente aún no está configurada en el servidor."
+        return None, "GEMINI_API_KEY no está configurada."
 
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    model = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview").strip()
     if not re.fullmatch(r"gemini-[A-Za-z0-9._-]+", model):
-        return None, "La configuración del modelo de consulta no es válida."
+        return None, "GEMINI_MODEL no tiene un formato válido."
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "systemInstruction": {
@@ -502,25 +502,25 @@ def gemini_answer(question):
             timeout=(5, 25),
         )
     except requests.Timeout:
-        return None, "La consulta tardó demasiado. Intenta de nuevo en un momento."
+        return None, "Gemini agotó el tiempo de espera."
     except requests.RequestException:
         app.logger.exception("No se pudo conectar con Gemini")
-        return None, "El servicio de consulta no está disponible en este momento."
+        return None, "No se pudo conectar con Gemini."
 
     if response.status_code == 429:
-        return None, "Se alcanzó el límite temporal de consultas. Intenta de nuevo más tarde."
+        return None, "Gemini alcanzó su límite de uso."
     if response.status_code in (401, 403):
         app.logger.error("Gemini rechazó la clave de API (HTTP %s)", response.status_code)
-        return None, "La configuración del servicio de consulta no es válida."
+        return None, f"Gemini rechazó la clave (HTTP {response.status_code})."
     if not response.ok:
         app.logger.error("Gemini respondió con HTTP %s", response.status_code)
-        return None, "No se pudo completar la consulta. Intenta de nuevo más tarde."
+        return None, f"Gemini respondió con HTTP {response.status_code}."
 
     try:
         data = response.json()
     except ValueError:
         app.logger.error("Gemini devolvió una respuesta que no es JSON")
-        return None, "El servicio de consulta devolvió una respuesta inválida."
+        return None, "Gemini devolvió una respuesta inválida."
 
     candidates = data.get("candidates") or []
     parts = (candidates[0].get("content") or {}).get("parts") or [] if candidates else []
@@ -530,7 +530,7 @@ def gemini_answer(question):
         if isinstance(part, dict) and part.get("text", "").strip()
     )
     if not answer:
-        return None, "No encontré una respuesta confiable para esa pregunta."
+        return None, "Gemini no devolvió una respuesta."
 
     grounding = candidates[0].get("groundingMetadata") or {}
     sources, seen_urls = [], set()
@@ -544,7 +544,69 @@ def gemini_answer(question):
                 "url": source_url,
                 "source": "Google Search",
             })
-    return {"answer": answer, "sources": sources, "updated": now_iso(), "query": question}, None
+    return {"answer": answer, "sources": sources, "updated": now_iso(), "query": question,
+            "provider": "Gemini"}, None
+
+
+def groq_answer(question):
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None, "GROQ_API_KEY no está configurada."
+
+    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", model):
+        return None, "GROQ_MODEL no tiene un formato válido."
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Responde siempre en español latinoamericano natural, claro y fluido. "
+                    "Contesta directamente y con brevedad. No inventes resultados, rankings, "
+                    "fechas ni datos actuales. Si la pregunta requiere información en tiempo real "
+                    "que no aparece en la conversación, dilo claramente y no adivines."
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 700,
+    }
+    try:
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=(5, 25),
+        )
+    except requests.Timeout:
+        return None, "Groq agotó el tiempo de espera."
+    except requests.RequestException:
+        app.logger.exception("No se pudo conectar con Groq")
+        return None, "No se pudo conectar con Groq."
+
+    if response.status_code == 429:
+        return None, "Groq alcanzó su límite de uso."
+    if response.status_code in (401, 403):
+        app.logger.error("Groq rechazó la clave de API (HTTP %s)", response.status_code)
+        return None, f"Groq rechazó la clave (HTTP {response.status_code})."
+    if not response.ok:
+        app.logger.error("Groq respondió con HTTP %s", response.status_code)
+        return None, f"Groq respondió con HTTP {response.status_code}."
+    try:
+        data = response.json()
+    except ValueError:
+        app.logger.error("Groq devolvió una respuesta que no es JSON")
+        return None, "Groq devolvió una respuesta inválida."
+
+    choices = data.get("choices") or []
+    answer = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+    if not answer:
+        return None, "Groq no devolvió una respuesta."
+    return {"answer": answer, "sources": [], "updated": now_iso(), "query": question,
+            "provider": "Groq"}, None
 
 
 @app.post("/api/consulta")
@@ -556,10 +618,14 @@ def consulta():
         return jsonify({"error": "Escribe una pregunta válida."}), 400
     if subject:
         question = f"{question}\nContexto: {subject}"
-    result, error = gemini_answer(question)
-    if error:
-        return jsonify({"error": error}), 503
-    return jsonify(result)
+    failures = []
+    for provider in (gemini_answer, groq_answer):
+        result, error = provider(question)
+        if result:
+            return jsonify(result)
+        failures.append(error)
+        app.logger.warning("Consulta fallida: %s", error)
+    return jsonify({"error": "No se pudo responder la consulta. " + " ".join(failures)}), 503
 
 
 if __name__ == "__main__":
